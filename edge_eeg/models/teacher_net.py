@@ -58,8 +58,8 @@ class TeacherConformerTCN(nn.Module):
             batch_first=True,
         )
         self.attention = nn.TransformerEncoder(encoder_layer, num_layers=1)
-        self.pool = nn.AdaptiveAvgPool1d(1)
-        self.classifier = nn.Linear(d_model, num_classes)
+        self.pool = nn.AdaptiveAvgPool1d(4)
+        self.classifier = nn.Linear(d_model * 4, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Input x shape: [Batch, 1, Channels, Time] -> squeeze to [Batch, Channels, Time]
@@ -71,5 +71,5 @@ class TeacherConformerTCN(nn.Module):
         feat_t = feat.transpose(1, 2)
         feat_t = self.attention(feat_t)
         feat = feat_t.transpose(1, 2)
-        pooled = self.pool(feat).squeeze(-1)
+        pooled = self.pool(feat).flatten(1)
         return self.classifier(pooled)

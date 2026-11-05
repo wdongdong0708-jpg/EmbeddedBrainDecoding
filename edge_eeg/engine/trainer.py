@@ -73,8 +73,10 @@ def _attach_teacher_logits_to_loader(
     """Augment a training DataLoader(x, y) into DataLoader(x, y, teacher_logits)."""
     ds: TensorDataset = train_loader.dataset  # type: ignore[assignment]
     x_train, y_train = ds.tensors[0], ds.tensors[1]
-    aug_ds = TensorDataset(x_train, y_train, teacher_logits.cpu())
-    return DataLoader(aug_ds, batch_size=train_loader.batch_size or 32, shuffle=True)
+    n_min = min(len(x_train), len(teacher_logits))
+    aug_ds = TensorDataset(x_train[:n_min], y_train[:n_min], teacher_logits[:n_min].cpu())
+    g = torch.Generator().manual_seed(42)
+    return DataLoader(aug_ds, batch_size=train_loader.batch_size or 32, shuffle=True, generator=g)
 
 
 def run_training_session(
@@ -92,6 +94,7 @@ def run_training_session(
     distill_teacher_logits: torch.Tensor | None = None,
     distill_temp: float = 2.5,
     distill_alpha: float = 0.5,
+    model_prefix: str = "edge_eeg_stage2",
 ) -> Dict[str, object]:
     """
     Execute training loop supporting:
@@ -100,6 +103,10 @@ def run_training_session(
     - Percentile-Clipped Per-Channel INT8 QAT fine-tuning & SQNR ablation
     - Automatic C99 static weight header export (`model_weights.h`)
     """
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+
     device = torch.device("cuda" if (use_gpu and torch.cuda.is_available()) else "cpu")
     model = model.to(device)
 
@@ -126,25 +133,30 @@ def run_training_session(
     valid_mask = counts > 0
     weights = torch.ones(num_classes, dtype=torch.float32)
     if valid_mask.any():
-        inv_freq = 1.0 / torch.sqrt(counts[valid_mask])
+        inv_freq = 1.0 / (counts[valid_mask] ** 0.85)
         weights[valid_mask] = inv_freq / inv_freq.mean()
     criterion = nn.CrossEntropyLoss(weight=weights.to(device))
 
     start_epoch = 1
     best_f1 = -1.0
+    best_acc = 0.0
     history: List[Dict[str, float]] = []
 
     last_ckpt = run_dir / "last.ckpt"
     best_ckpt = run_dir / "best.ckpt"
 
     if resume == "auto" and last_ckpt.exists() and not qat:
-        ckpt = torch.load(last_ckpt, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model_state"])
-        optimizer.load_state_dict(ckpt["optimizer_state"])
-        start_epoch = int(ckpt["epoch"]) + 1
-        best_f1 = float(ckpt.get("best_f1", -1.0))
-        history = list(ckpt.get("history", []))
-        print(f"[trainer] Resumed from {last_ckpt} at epoch {start_epoch} (best_f1={best_f1:.4f})")
+        try:
+            ckpt = torch.load(last_ckpt, map_location=device, weights_only=False)
+            model.load_state_dict(ckpt["model_state"])
+            optimizer.load_state_dict(ckpt["optimizer_state"])
+            start_epoch = int(ckpt["epoch"]) + 1
+            best_f1 = float(ckpt.get("best_f1", -1.0))
+            history = list(ckpt.get("history", []))
+            print(f"[trainer] Resumed from {last_ckpt} at epoch {start_epoch} (best_f1={best_f1:.4f})")
+        except RuntimeError:
+            print(f"[trainer] Checkpoint architecture mismatch at {last_ckpt}; starting fresh training.")
+            start_epoch = 1
 
     print(
         f"[trainer] Device: {device} | Arch: {type(model).__name__} | Params: {total_params:,} "
@@ -155,7 +167,7 @@ def run_training_session(
         torch.cuda.reset_peak_memory_stats(device)
 
     t0 = time.time()
-    fp32_epochs = max(int(round(epochs * 0.6)), 1) if qat else epochs
+    fp32_epochs = max(int(round(epochs * 0.7)), 1) if qat else epochs
     qat_epochs = max(epochs - fp32_epochs, 1) if qat else 0
 
     for epoch in range(start_epoch, fp32_epochs + 1):
@@ -183,6 +195,7 @@ def run_training_session(
                 loss = ce_loss
 
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             bs = x_b.size(0)
@@ -199,12 +212,14 @@ def run_training_session(
         is_best = val_metrics["val_f1_macro"] >= best_f1
         if is_best:
             best_f1 = val_metrics["val_f1_macro"]
+            best_acc = val_metrics["val_acc"]
 
         state = {
             "epoch": epoch,
             "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "best_f1": best_f1,
+            "best_acc": best_acc,
             "history": history,
             "total_params": total_params,
         }
@@ -219,6 +234,16 @@ def run_training_session(
             f"val_F1={val_metrics['val_f1_macro']*100:.1f}%"
             + (" [BEST]" if is_best else "")
         )
+
+    # Restore best FP32 checkpoint before reparameterization, QAT, or Teacher Logits extraction
+    if best_ckpt.exists():
+        try:
+            best_state = torch.load(best_ckpt, map_location=device, weights_only=False)
+            model.load_state_dict(best_state["model_state"])
+            best_f1 = float(best_state.get("best_f1", best_f1))
+            best_acc = float(best_state.get("best_acc", best_acc))
+        except RuntimeError:
+            pass
 
     reparam_report: Dict[str, float] = {}
     quant_report: Dict[str, float] = {}
@@ -248,7 +273,17 @@ def run_training_session(
         if hasattr(model, "deploy_reparameterize"):
             model.deploy_reparameterize()
         model = insert_qat_wrappers(model, percentile=99.5).to(device)
-        qat_optimizer = torch.optim.AdamW(model.parameters(), lr=lr * 0.25, weight_decay=1e-5)
+
+        # Calibrate initial percentile activation clipping bounds on 1 pass over training data without weight update
+        model.train()
+        with torch.no_grad():
+            for batch in train_loader:
+                _ = model(batch[0].to(device))
+        init_qat_metrics = evaluate_model(model, val_loader, criterion, device, num_classes)
+        best_qat_f1 = init_qat_metrics["val_f1_macro"]
+        best_qat_state = copy.deepcopy(model.state_dict())
+
+        qat_optimizer = torch.optim.AdamW(model.parameters(), lr=lr * 0.2, weight_decay=1e-5)
 
         print(f"[qat] Starting Percentile-Clipped (99.5%) Per-Channel INT8 QAT for {qat_epochs} epoch(s)...")
         for q_ep in range(1, qat_epochs + 1):
@@ -261,8 +296,19 @@ def run_training_session(
                 y_b = batch[1].to(device)
                 qat_optimizer.zero_grad(set_to_none=True)
                 logits = model(x_b)
-                loss = criterion(logits, y_b)
+                ce_loss = criterion(logits, y_b)
+                if len(batch) >= 3:
+                    t_logits = batch[2].to(device)
+                    kd_loss = F.kl_div(
+                        F.log_softmax(logits / distill_temp, dim=-1),
+                        F.softmax(t_logits / distill_temp, dim=-1),
+                        reduction="batchmean",
+                    ) * (distill_temp ** 2)
+                    loss = (1.0 - distill_alpha) * ce_loss + distill_alpha * kd_loss
+                else:
+                    loss = ce_loss
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 qat_optimizer.step()
                 bs = x_b.size(0)
                 q_loss_sum += float(loss.item()) * bs
@@ -270,14 +316,21 @@ def run_training_session(
                 q_total += bs
 
             val_metrics = evaluate_model(model, val_loader, criterion, device, num_classes)
+            is_q_best = val_metrics["val_f1_macro"] >= best_qat_f1
+            if is_q_best:
+                best_qat_f1 = val_metrics["val_f1_macro"]
+                best_qat_state = copy.deepcopy(model.state_dict())
             if val_metrics["val_f1_macro"] >= best_f1:
                 best_f1 = val_metrics["val_f1_macro"]
+                best_acc = val_metrics["val_acc"]
             print(
                 f"  [QAT ] Epoch [{q_ep:02d}/{qat_epochs:02d}] "
                 f"train_loss={q_loss_sum/max(q_total,1):.4f} train_acc={q_correct/max(q_total,1)*100:.1f}% | "
                 f"val_acc={val_metrics['val_acc']*100:.1f}% val_F1={val_metrics['val_f1_macro']*100:.1f}%"
+                + (" [BEST-QAT]" if is_q_best else "")
             )
 
+        model.load_state_dict(best_qat_state)
         quant_report = evaluate_quantization_ablation(
             fp32_model=fp32_ref_model,
             qat_model=model,
@@ -293,7 +346,7 @@ def run_training_session(
             f"Proposed Percentile QAT INT8 F1={quant_report['qat_int8_f1_macro']*100:.1f}% "
             f"(SQNR={quant_report['qat_sqnr_db']:.1f} dB, CosSim={quant_report['qat_cosine_sim']:.4f})"
         )
-        export_report = export_model_to_c_header(model, run_dir)
+        export_report = export_model_to_c_header(model, run_dir, model_prefix=model_prefix)
 
     elapsed = time.time() - t0
     peak_vram_mb = (
@@ -308,6 +361,7 @@ def run_training_session(
         "total_params": total_params,
         "fp32_weight_kb": round(fp32_kb, 2),
         "int8_weight_kb": round(int8_kb, 2),
+        "best_val_acc": round(best_acc, 4),
         "best_val_f1_macro": round(best_f1, 4),
         "elapsed_sec": round(elapsed, 2),
         "peak_cuda_mb": round(peak_vram_mb, 2),

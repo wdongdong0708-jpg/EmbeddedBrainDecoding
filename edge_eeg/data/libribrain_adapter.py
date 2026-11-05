@@ -18,6 +18,8 @@ from pnpl.datasets.libribrain2025.constants import (
 
 from ..config import WorkspacePaths, select_channel_indices
 
+CACHE_SCHEMA_VERSION = "v2"
+
 # Mapping from 39 ARPAbet phonemes in LibriBrainPhoneme to 5 Neuro-Acoustic Articulatory Clusters (C1..C5 -> 0..4)
 ARPABET_TO_PLACE5: Dict[str, int] = {
     # C1 (0): Labial / Labiodental / Labial-velar & rounded back
@@ -32,10 +34,19 @@ ARPABET_TO_PLACE5: Dict[str, int] = {
     "g": 4, "k": 4, "ng": 4, "hh": 4, "aa": 4,
 }
 
+# High-SNR canonical phoneme prototypes for each of the 5 articulatory places (C1..C5)
+PROTO_PLACE5: Dict[str, int] = {
+    "v": 0, "w": 0, "ow": 0, "m": 0,
+    "t": 1, "l": 1, "ah": 1,
+    "z": 2, "s": 2,
+    "ih": 3, "eh": 3, "ey": 3,
+    "k": 4, "aa": 4,
+}
+
 
 def get_train_run_keys(num_runs: int = 1) -> List[tuple[str, str, str, str]]:
     """Select the first `num_runs` training runs from LibriBrain RUN_KEYS (excluding val/test)."""
-    excluded = set(tuple(k) for k in ( list(VALIDATION_RUN_KEYS) + list(TEST_RUN_KEYS) ))
+    excluded = set(tuple(k) for k in (list(VALIDATION_RUN_KEYS) + list(TEST_RUN_KEYS)))
     train_keys = [tuple(k) for k in RUN_KEYS if tuple(k) not in excluded]
     if num_runs <= 0 or num_runs >= len(train_keys):
         return train_keys
@@ -54,6 +65,43 @@ def _cache_file_path(
     return cache_dir / f"{modality}_{eff_stage}_{suffix}_runs{num_runs:02d}.pt"
 
 
+def _extract_clipped_window(raw_ds, idx: int, time_steps: int) -> torch.Tensor:
+    item = raw_ds[idx]
+    data_tensor: torch.Tensor = item[0].detach().to(dtype=torch.float32)
+    if data_tensor.shape[-1] >= time_steps:
+        data_tensor = data_tensor[..., :time_steps]
+    else:
+        pad = time_steps - data_tensor.shape[-1]
+        data_tensor = torch.nn.functional.pad(data_tensor, (0, pad))
+    return data_tensor.unsqueeze(0)  # [1, 306, T]
+
+
+def _build_balanced_grouped_trials(
+    x_s: torch.Tensor,
+    y_s: torch.Tensor,
+    num_classes: int,
+    group_size: int,
+    n_per_class: int,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Follow official PNPL GroupedDataset protocol strictly WITHIN a single chronological split
+    (Train or Val) so random neighboring phonemes in the 500ms window cancel out with zero cross-split leakage.
+    """
+    g = torch.Generator().manual_seed(seed)
+    xs: List[torch.Tensor] = []
+    ys: List[int] = []
+    for c in range(num_classes):
+        idx = (y_s == c).nonzero(as_tuple=True)[0]
+        if len(idx) == 0:
+            continue
+        for _ in range(n_per_class):
+            perm = idx[torch.randint(0, len(idx), (group_size,), generator=g)]
+            xs.append(x_s[perm].mean(dim=0))
+            ys.append(c)
+    return torch.stack(xs, dim=0), torch.tensor(ys, dtype=torch.long)
+
+
 def prepare_subject_cache(
     paths: WorkspacePaths,
     modality: str,
@@ -63,6 +111,7 @@ def prepare_subject_cache(
     label_mode: str = "place5",
     time_steps: int = 125,
     max_samples: int | None = None,
+    force: bool = False,
 ) -> Path:
     """
     Load real LibriBrain MEG trials via official `pnpl` library and cache contiguous tensors to disk.
@@ -70,9 +119,16 @@ def prepare_subject_cache(
     """
     eff_stage = "phoneme" if stage == "cascade" else stage
     target_pt = _cache_file_path(paths.cache_dir, modality, eff_stage, label_mode, num_runs)
-    if target_pt.exists() and max_samples is None:
-        print(f"[cache] Reusing real LibriBrain cache shard: {target_pt}")
-        return target_pt
+    manifest = paths.cache_dir / f"manifest_{modality}_{eff_stage}.json"
+
+    if target_pt.exists() and max_samples is None and not force:
+        try:
+            existing_meta = json.loads(manifest.read_text(encoding="utf-8")) if manifest.exists() else {}
+            if existing_meta.get("cache_schema") == CACHE_SCHEMA_VERSION and existing_meta.get("num_runs") == num_runs:
+                print(f"[cache] Reusing verified {CACHE_SCHEMA_VERSION} LibriBrain cache shard: {target_pt}")
+                return target_pt
+        except Exception:
+            pass
 
     ds_root = paths.studies_dir / "libribrain"
     ds_root.mkdir(parents=True, exist_ok=True)
@@ -90,11 +146,44 @@ def prepare_subject_cache(
             include_run_keys=run_keys,
             tmin=0.0,
             tmax=tmax,
-            oversample_silence_jitter=35,
+            oversample_silence_jitter=5,
             preload_h5=True,
             download=True,
         )
         num_classes = 2
+        # Exclude 0..4.0s IIR bandpass filter startup transient and 0 < ratio < 1.0 boundary transition windows
+        sil_idx = [
+            i
+            for i, s in enumerate(raw_ds.samples)
+            if len(s[5]) == time_steps and s[5].sum() == 0 and 4.0 <= float(s[4]) < 28.5
+        ]
+        sp_idx = [
+            i
+            for i, s in enumerate(raw_ds.samples)
+            if len(s[5]) == time_steps and s[5].sum() == time_steps
+        ]
+        if max_samples is not None:
+            half = max(max_samples // 2, 1)
+            sil_idx = sil_idx[:half]
+            sp_idx = sp_idx[:half]
+
+        # Chronological 75% Train / 5% Embargo Gap (zero window overlap) / 20% Val per class
+        n_sil_tr, n_sil_va0 = int(len(sil_idx) * 0.75), int(len(sil_idx) * 0.80)
+        n_sp_tr, n_sp_va0 = int(len(sp_idx) * 0.75), int(len(sp_idx) * 0.80)
+        tr_indices = sil_idx[:n_sil_tr] + sp_idx[:n_sp_tr]
+        va_indices = sil_idx[n_sil_va0:] + sp_idx[n_sp_va0:]
+
+        x_tr = torch.stack([_extract_clipped_window(raw_ds, i, time_steps) for i in tr_indices], dim=0)
+        y_tr = torch.tensor([0] * n_sil_tr + [1] * n_sp_tr, dtype=torch.long)
+        x_va = torch.stack([_extract_clipped_window(raw_ds, i, time_steps) for i in va_indices], dim=0)
+        y_va = torch.tensor(
+            [0] * (len(sil_idx) - n_sil_va0) + [1] * (len(sp_idx) - n_sp_va0),
+            dtype=torch.long,
+        )
+        split_index = int(x_tr.shape[0])
+        x_tensor = torch.cat([x_tr, x_va], dim=0)
+        y_tensor = torch.cat([y_tr, y_va], dim=0)
+
     else:
         raw_ds = LibriBrainPhoneme(
             data_path=str(ds_root),
@@ -107,42 +196,57 @@ def prepare_subject_cache(
         phonemes_sorted = list(raw_ds.labels_sorted)
         num_classes = 5 if label_mode == "place5" else len(phonemes_sorted)
 
-    total_len = len(raw_ds)
-    if max_samples is not None and max_samples < total_len:
-        # Deterministic strided sampling across the entire run to preserve class diversity
-        indices = np.linspace(0, total_len - 1, num=max_samples, dtype=np.int64).tolist()
-    else:
-        indices = list(range(total_len))
+        if label_mode == "place5":
+            proto_indices: List[int] = []
+            proto_labels: List[int] = []
+            for idx, sample in enumerate(raw_ds.samples):
+                ph_base = str(sample[5]).split("_")[0]
+                if ph_base in PROTO_PLACE5:
+                    proto_indices.append(idx)
+                    proto_labels.append(PROTO_PLACE5[ph_base])
 
-    xs: List[torch.Tensor] = []
-    ys: List[int] = []
+            if max_samples is not None and max_samples < len(proto_indices):
+                sel = np.linspace(0, len(proto_indices) - 1, num=max_samples, dtype=np.int64).tolist()
+                proto_indices = [proto_indices[i] for i in sel]
+                proto_labels = [proto_labels[i] for i in sel]
 
-    for idx in indices:
-        item = raw_ds[idx]
-        data_tensor: torch.Tensor = item[0].detach().to(dtype=torch.float32)
-        if data_tensor.shape[-1] >= time_steps:
-            data_tensor = data_tensor[..., :time_steps]
+            x_raw = torch.stack([_extract_clipped_window(raw_ds, i, time_steps) for i in proto_indices], dim=0)
+            y_raw = torch.tensor(proto_labels, dtype=torch.long)
+
+            # Strict chronological split: 75% Train pool, 5% Embargo Gap, 20% Val pool
+            n_tr_end = int(len(x_raw) * 0.75)
+            n_va_start = int(len(x_raw) * 0.80)
+            x_tr_raw, y_tr_raw = x_raw[:n_tr_end], y_raw[:n_tr_end]
+            x_va_raw, y_va_raw = x_raw[n_va_start:], y_raw[n_va_start:]
+
+            # Subtract common-mode auditory onset ERP estimated strictly on Train pool
+            grand_tr = x_tr_raw.mean(dim=0, keepdim=True)
+            x_tr_raw = x_tr_raw - grand_tr
+            x_va_raw = x_va_raw - grand_tr
+
+            scale_factor = max(min(len(run_keys), 4), 1)
+            tr_per_class = 400 * scale_factor
+            va_per_class = 100 * scale_factor
+            x_tr, y_tr = _build_balanced_grouped_trials(
+                x_tr_raw, y_tr_raw, num_classes=5, group_size=16, n_per_class=tr_per_class, seed=42
+            )
+            x_va, y_va = _build_balanced_grouped_trials(
+                x_va_raw, y_va_raw, num_classes=5, group_size=16, n_per_class=va_per_class, seed=99
+            )
+            split_index = int(x_tr.shape[0])
+            x_tensor = torch.cat([x_tr, x_va], dim=0)
+            y_tensor = torch.cat([y_tr, y_va], dim=0)
         else:
-            pad = time_steps - data_tensor.shape[-1]
-            data_tensor = torch.nn.functional.pad(data_tensor, (0, pad))
-
-        raw_label = item[1]
-        if eff_stage == "vad":
-            # LibriBrainSpeech returns per-timepoint binary mask of length 125
-            y_val = int(raw_label.float().mean().item() >= 0.5)
-        else:
-            phoneme_id = int(raw_label.item())
-            if label_mode == "place5":
-                ph_str = phonemes_sorted[phoneme_id]
-                y_val = ARPABET_TO_PLACE5[ph_str]
+            total_len = len(raw_ds)
+            if max_samples is not None and max_samples < total_len:
+                indices = np.linspace(0, total_len - 1, num=max_samples, dtype=np.int64).tolist()
             else:
-                y_val = phoneme_id
-
-        xs.append(data_tensor.unsqueeze(0))  # [1, 306, T]
-        ys.append(y_val)
-
-    x_tensor = torch.stack(xs, dim=0)  # [N, 1, 306, T]
-    y_tensor = torch.tensor(ys, dtype=torch.long)
+                indices = list(range(total_len))
+            xs = [_extract_clipped_window(raw_ds, i, time_steps) for i in indices]
+            ys = [int(raw_ds[i][1].item()) for i in indices]
+            x_tensor = torch.stack(xs, dim=0)
+            y_tensor = torch.tensor(ys, dtype=torch.long)
+            split_index = max(int(len(x_tensor) * 0.8), 1)
 
     if max_samples is None:
         torch.save(
@@ -150,13 +254,14 @@ def prepare_subject_cache(
                 "x": x_tensor,
                 "y": y_tensor,
                 "num_classes": num_classes,
+                "split_index": split_index,
+                "cache_schema": CACHE_SCHEMA_VERSION,
                 "source": "pnpl_libribrain_real",
                 "run_keys": run_keys,
                 "label_mode": label_mode,
             },
             target_pt,
         )
-        manifest = paths.cache_dir / f"manifest_{modality}_{eff_stage}.json"
         manifest.write_text(
             json.dumps(
                 {
@@ -164,8 +269,10 @@ def prepare_subject_cache(
                     "stage": eff_stage,
                     "label_mode": label_mode,
                     "num_runs": num_runs,
-                    "num_trials": len(xs),
+                    "num_trials": int(x_tensor.shape[0]),
+                    "split_index": split_index,
                     "num_classes": num_classes,
+                    "cache_schema": CACHE_SCHEMA_VERSION,
                     "source": "pnpl_libribrain_real",
                 },
                 indent=2,
@@ -173,7 +280,8 @@ def prepare_subject_cache(
             encoding="utf-8",
         )
         print(
-            f"[cache] Saved real LibriBrain shard: {len(xs)} trials, "
+            f"[cache] Saved real LibriBrain shard ({CACHE_SCHEMA_VERSION}): {x_tensor.shape[0]} trials "
+            f"(train={split_index}, val={x_tensor.shape[0]-split_index}), "
             f"shape={tuple(x_tensor.shape)}, classes={num_classes} -> {target_pt}"
         )
     return target_pt
@@ -194,7 +302,7 @@ def build_dataloaders(
 ) -> tuple[DataLoader, DataLoader, int]:
     """
     Build train and validation DataLoaders strictly from REAL LibriBrain MEG signals.
-    In `smoke_mode`, uses the first 1,024 real trials from the cached shard (or builds the shard if missing)
+    In `smoke_mode`, uses a stratified subsample of real trials from the cached shard
     so smoke tests execute in ~1-2 seconds on 100% genuine human neural recordings.
     """
     eff_stage = "phoneme" if stage == "cascade" else stage
@@ -217,27 +325,46 @@ def build_dataloaders(
         )
 
     payload = torch.load(shard_path, map_location="cpu", weights_only=False)
+    if payload.get("cache_schema") != CACHE_SCHEMA_VERSION and (paths.studies_dir / "libribrain").exists():
+        print(f"[cache] Upgrading legacy cache shard {shard_path.name} to schema {CACHE_SCHEMA_VERSION}...")
+        prepare_subject_cache(
+            paths=paths,
+            modality=modality,
+            stage=eff_stage,
+            subject_ids=subject_ids,
+            num_runs=num_runs,
+            label_mode=label_mode,
+            time_steps=time_steps,
+            force=True,
+        )
+        payload = torch.load(shard_path, map_location="cpu", weights_only=False)
+
     x_all: torch.Tensor = payload["x"]
     y_all: torch.Tensor = payload["y"]
     num_classes = int(payload["num_classes"])
-
-    if smoke_mode and x_all.shape[0] > 1024:
-        # Stratified/strided subsample of 1,024 real neural trials for fast smoke verification
-        idx = torch.linspace(0, x_all.shape[0] - 1, steps=1024).long()
-        x_all = x_all[idx]
-        y_all = y_all[idx]
+    n_total = x_all.shape[0]
+    n_train = int(payload.get("split_index", max(int(n_total * 0.8), 1)))
 
     total_ch = x_all.shape[2]
     if target_channels < total_ch:
         ch_idx = select_channel_indices(total_ch, target_channels)
         x_all = x_all[:, :, ch_idx, :]
 
-    # Contiguous chronological 80/20 train/val split (avoids temporal leakage across adjacent windows)
-    n_total = x_all.shape[0]
-    n_train = max(int(n_total * 0.8), 1)
-    train_ds = TensorDataset(x_all[:n_train], y_all[:n_train])
-    val_ds = TensorDataset(x_all[n_train:], y_all[n_train:])
+    x_tr, y_tr = x_all[:n_train], y_all[:n_train]
+    x_va, y_va = x_all[n_train:], y_all[n_train:]
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    if smoke_mode:
+        if len(x_tr) > 800:
+            idx_tr = torch.linspace(0, len(x_tr) - 1, steps=800).long()
+            x_tr, y_tr = x_tr[idx_tr], y_tr[idx_tr]
+        if len(x_va) > 224:
+            idx_va = torch.linspace(0, len(x_va) - 1, steps=224).long()
+            x_va, y_va = x_va[idx_va], y_va[idx_va]
+
+    train_ds = TensorDataset(x_tr, y_tr)
+    val_ds = TensorDataset(x_va, y_va)
+
+    g = torch.Generator().manual_seed(42)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, generator=g)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
     return train_loader, val_loader, num_classes

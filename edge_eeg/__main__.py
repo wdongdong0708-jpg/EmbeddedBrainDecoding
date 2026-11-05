@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
 import sys
 import torch
 from torch.utils.data import DataLoader
@@ -51,13 +53,173 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--devices", type=int, default=1, help="Number of accelerator devices")
     p.add_argument("--cpu-threads", type=int, default=4, help="PyTorch CPU thread limit")
     p.add_argument("--require-cache", action="store_true", help="Fail immediately if NVMe cache is missing")
+    p.add_argument("--force-cache", action="store_true", help="Force rebuild of NVMe feature cache")
     p.add_argument("--resume", choices=["none", "auto"], default="none", help="Auto-resume from last.ckpt")
     p.add_argument("--qat", action="store_true", help="Enable Reparameterization + Percentile Per-Channel INT8 QAT")
     p.add_argument("--distill", action="store_true", help="Enable 306-ch Teacher -> 8-ch Student Knowledge Distillation")
     p.add_argument("--verify-codebook", action="store_true", help="Print 12-sentence Hamming distance report")
 
 
-def _print_codebook_and_viterbi_report() -> None:
+@torch.no_grad()
+def _extract_and_save_teacher_logits(
+    teacher: torch.nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    teacher_dir: Path,
+    device: torch.device,
+    best_val_f1: float,
+    num_runs: int,
+    label_mode: str,
+) -> tuple[torch.Tensor, Path]:
+    """Compute soft logits from the best 306-channel TeacherConformerTCN and persist `teacher_logits.pt`."""
+    best_ckpt = teacher_dir / "best.ckpt"
+    if best_ckpt.exists():
+        try:
+            ckpt = torch.load(best_ckpt, map_location=device, weights_only=False)
+            teacher.load_state_dict(ckpt["model_state"])
+            best_val_f1 = float(ckpt.get("best_f1", best_val_f1))
+        except RuntimeError:
+            pass
+
+    teacher = teacher.to(device).eval()
+    bs = train_loader.batch_size or 32
+    seq_train_loader = DataLoader(train_loader.dataset, batch_size=bs, shuffle=False)
+    train_logits_list = [teacher( batch[0].to(device) ).cpu() for batch in seq_train_loader]
+    train_logits = torch.cat(train_logits_list, dim=0)
+
+    seq_val_loader = DataLoader(val_loader.dataset, batch_size=bs, shuffle=False)
+    val_logits_list = [teacher( batch[0].to(device) ).cpu() for batch in seq_val_loader]
+    val_logits = torch.cat(val_logits_list, dim=0)
+
+    logits_path = teacher_dir / "teacher_logits.pt"
+    torch.save(
+        {
+            "train_logits": train_logits,
+            "val_logits": val_logits,
+            "best_val_f1_macro": round(best_val_f1, 4),
+            "num_runs": num_runs,
+            "label_mode": label_mode,
+        },
+        logits_path,
+    )
+    metrics_path = teacher_dir / "metrics.json"
+    if metrics_path.exists():
+        try:
+            meta = json.loads(metrics_path.read_text(encoding="utf-8"))
+            meta["teacher_logits_path"] = str(logits_path)
+            meta["teacher_logits_shape"] = list(train_logits.shape)
+            metrics_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    print(
+        f"[teacher] Saved 306-ch Teacher Logits (train={tuple(train_logits.shape)}, "
+        f"val={tuple(val_logits.shape)}, best_F1={best_val_f1*100:.1f}%) -> {logits_path}"
+    )
+    return train_logits, logits_path
+
+
+def _compute_teacher_distillation_logits(
+    paths: WorkspacePaths,
+    args: argparse.Namespace,
+    subject_ids: list[str],
+    subset_tag: str,
+    smoke_mode: bool,
+    expected_train_len: int,
+) -> torch.Tensor:
+    """Load precomputed `teacher_logits.pt` if available, or run/train 306-ch TeacherConformerTCN to generate it."""
+    full_ch = 306 if args.modality == "meg" else 64
+    eff_tag = "smoke" if smoke_mode else subset_tag
+    teacher_dir = paths.get_run_dir(
+        stage=args.stage,
+        modality=args.modality,
+        arch="teacher_conformer",
+        channels=full_ch,
+        subset_tag=eff_tag,
+    )
+    logits_path = teacher_dir / "teacher_logits.pt"
+    if logits_path.exists():
+        try:
+            payload = torch.load(logits_path, map_location="cpu", weights_only=False)
+            saved_logits: torch.Tensor = payload["train_logits"]
+            if len(saved_logits) >= expected_train_len:
+                f1_val = float(payload.get("best_val_f1_macro", 0.0))
+                print(
+                    f"[distill] Loaded saved 306-ch Teacher Logits from {logits_path} "
+                    f"(shape={tuple(saved_logits[:expected_train_len].shape)}, teacher_F1={f1_val*100:.1f}%)"
+                )
+                return saved_logits[:expected_train_len]
+        except Exception:
+            pass
+
+    t_train_loader, t_val_loader, num_classes = build_dataloaders(
+        paths=paths,
+        modality=args.modality,
+        stage=args.stage,
+        subject_ids=subject_ids,
+        target_channels=full_ch,
+        time_steps=args.time_steps,
+        batch_size=args.batch_size,
+        num_runs=args.num_runs,
+        label_mode=args.label_mode,
+        require_cache=args.require_cache,
+        smoke_mode=smoke_mode,
+    )
+    teacher = build_model(
+        stage=args.stage,
+        arch="teacher_conformer",
+        num_channels=full_ch,
+        time_steps=args.time_steps,
+        num_classes=num_classes,
+    )
+    best_ckpt = teacher_dir / "best.ckpt"
+    best_f1 = 0.0
+    if best_ckpt.exists():
+        ckpt = torch.load(best_ckpt, map_location="cpu", weights_only=False)
+        try:
+            teacher.load_state_dict(ckpt["model_state"])
+            best_f1 = float(ckpt.get("best_f1", 0.0))
+            print(f"[distill] Loaded pre-trained 306-ch Teacher checkpoint from {best_ckpt}")
+        except RuntimeError:
+            best_ckpt = teacher_dir / "nonexistent.ckpt"
+
+    if not best_ckpt.exists():
+        print("[distill] Training 306-ch TeacherConformerTCN first to generate soft targets...")
+        t_summary = run_training_session(
+            model=teacher,
+            train_loader=t_train_loader,
+            val_loader=t_val_loader,
+            num_classes=num_classes,
+            run_dir=teacher_dir,
+            subject_ids=subject_ids,
+            epochs=max(args.epochs // 2, 2),
+            lr=args.lr * 0.5,
+            resume="none",
+            use_gpu=(args.devices > 0),
+            qat=False,
+            model_prefix=f"edge_eeg_{args.stage}_teacher",
+        )
+        best_f1 = float(t_summary.get("best_val_f1_macro", 0.0))
+
+    device = torch.device("cuda" if (args.devices > 0 and torch.cuda.is_available()) else "cpu")
+    train_logits, _ = _extract_and_save_teacher_logits(
+        teacher=teacher,
+        train_loader=t_train_loader,
+        val_loader=t_val_loader,
+        teacher_dir=teacher_dir,
+        device=device,
+        best_val_f1=best_f1,
+        num_runs=args.num_runs,
+        label_mode=args.label_mode,
+    )
+    return train_logits[:expected_train_len]
+
+
+def _print_codebook_and_viterbi_report(
+    paths: WorkspacePaths | None = None,
+    subset_tag: str = "sub001",
+    modality: str = "meg",
+) -> None:
     print("=" * 78)
     print("  [Thesis Sec 2.1] 12-Sentence Mandarin Command Codebook & Hamming Analysis")
     print("=" * 78)
@@ -97,78 +259,54 @@ def _print_codebook_and_viterbi_report() -> None:
         f"  -> [12-Sentence Set] Stage 3 Viterbi (8D MCU INT8) : {sim12['viterbi_joint_int8_acc']*100:5.1f}%\n"
         f"  -> [4-Sentence EEG ] Stage 3 Viterbi (8D MCU INT8) : {sim4['viterbi_joint_int8_acc']*100:5.1f}%"
     )
+
+    if paths is not None:
+        r1_path = paths.results_dir / f"vad_{modality}_student_tiny_8ch_{subset_tag}" / "metrics.json"
+        r2_path = paths.results_dir / f"phoneme_{modality}_teacher_conformer_306ch_{subset_tag}" / "metrics.json"
+        r3_path = paths.results_dir / f"phoneme_{modality}_rep_tcn_8ch_{subset_tag}" / "metrics.json"
+        if any(p.exists() for p in (r1_path, r2_path, r3_path)):
+            print("-" * 78)
+            print(f"  [Thesis Ch 3/4/5] Empirical 3-Round Summary ({subset_tag}):")
+            thesis_summary: dict[str, object] = {"subset_tag": subset_tag}
+            if r1_path.exists():
+                m1 = json.loads(r1_path.read_text(encoding="utf-8"))
+                thesis_summary["round1_stage1_vad"] = m1
+                q1 = m1.get("quantization_ablation", {})
+                c1 = m1.get("c_export", {})
+                print(
+                    f"  * Round 1 [Ch 3 Stage 1 VAD 8-ch MicroVADNet]   : "
+                    f"Best Val F1={m1.get('best_val_f1_macro', 0)*100:.2f}% | "
+                    f"INT8 QAT F1={q1.get('qat_int8_f1_macro', m1.get('best_val_f1_macro', 0))*100:.2f}% | "
+                    f"Flash={c1.get('total_int8_weight_kb', m1.get('int8_weight_kb', 0))} KB"
+                )
+            if r2_path.exists():
+                m2 = json.loads(r2_path.read_text(encoding="utf-8"))
+                thesis_summary["round2_stage2_teacher"] = m2
+                print(
+                    f"  * Round 2 [Ch 4 Stage 2 Teacher 306-ch Probe]   : "
+                    f"Best Val F1={m2.get('best_val_f1_macro', 0)*100:.2f}% "
+                    f"(Acc={m2.get('best_val_acc', 0)*100:.2f}%) | "
+                    f"Logits={m2.get('teacher_logits_path', 'saved')}"
+                )
+            if r3_path.exists():
+                m3 = json.loads(r3_path.read_text(encoding="utf-8"))
+                thesis_summary["round3_stage2_student"] = m3
+                rep = m3.get("reparameterization", {})
+                q3 = m3.get("quantization_ablation", {})
+                c3 = m3.get("c_export", {})
+                print(
+                    f"  * Round 3 [Ch 4 Stage 2 Student 8-ch RepTCN+KD] : "
+                    f"Best Val F1={m3.get('best_val_f1_macro', 0)*100:.2f}% | "
+                    f"SRAM -{rep.get('arena_sram_reduction_pct', 0):.1f}% "
+                    f"({rep.get('multi_branch_arena_int8_kb', 0)}->{rep.get('deploy_arena_int8_kb', 0)} KB) | "
+                    f"QAT SQNR={q3.get('qat_sqnr_db', 0):.1f} dB (vs PTQ {q3.get('ptq_sqnr_db', 0):.1f} dB) | "
+                    f"Flash={c3.get('total_int8_weight_kb', 0)} KB -> {c3.get('header_path', '')}"
+                )
+            thesis_summary["stage3_viterbi_12cmd"] = sim12
+            thesis_summary["stage3_viterbi_4cmd"] = sim4
+            out_json = paths.results_dir / f"thesis_ch3_4_5_summary_{subset_tag}.json"
+            out_json.write_text(json.dumps(thesis_summary, indent=2), encoding="utf-8")
     print("=" * 78)
-
-
-def _compute_teacher_distillation_logits(
-    paths: WorkspacePaths,
-    args: argparse.Namespace,
-    subject_ids: list[str],
-    subset_tag: str,
-    smoke_mode: bool,
-) -> torch.Tensor:
-    """Load or train the 306-channel TeacherConformerTCN and extract soft logits over the training split."""
-    full_ch = 306 if args.modality == "meg" else 64
-    t_train_loader, t_val_loader, num_classes = build_dataloaders(
-        paths=paths,
-        modality=args.modality,
-        stage=args.stage,
-        subject_ids=subject_ids,
-        target_channels=full_ch,
-        time_steps=args.time_steps,
-        batch_size=args.batch_size,
-        num_runs=args.num_runs,
-        label_mode=args.label_mode,
-        require_cache=args.require_cache,
-        smoke_mode=smoke_mode,
-    )
-    teacher = build_model(
-        stage=args.stage,
-        arch="teacher_conformer",
-        num_channels=full_ch,
-        time_steps=args.time_steps,
-        num_classes=num_classes,
-    )
-    teacher_dir = paths.get_run_dir(
-        stage=args.stage,
-        modality=args.modality,
-        arch="teacher_conformer",
-        channels=full_ch,
-        subset_tag="smoke" if smoke_mode else subset_tag,
-    )
-    best_ckpt = teacher_dir / "best.ckpt"
-    if best_ckpt.exists():
-        ckpt = torch.load(best_ckpt, map_location="cpu", weights_only=False)
-        try:
-            teacher.load_state_dict(ckpt["model_state"])
-            print(f"[distill] Loaded pre-trained 306-ch Teacher checkpoint from {best_ckpt}")
-        except RuntimeError:
-            best_ckpt = teacher_dir / "nonexistent.ckpt"
-
-    if not best_ckpt.exists():
-        print(f"[distill] Training 306-ch TeacherConformerTCN first to generate soft targets...")
-        run_training_session(
-            model=teacher,
-            train_loader=t_train_loader,
-            val_loader=t_val_loader,
-            num_classes=num_classes,
-            run_dir=teacher_dir,
-            subject_ids=subject_ids,
-            epochs=max(args.epochs // 2, 2),
-            lr=args.lr * 0.5,
-            resume="none",
-            use_gpu=(args.devices > 0),
-            qat=False,
-        )
-
-    device = torch.device("cuda" if (args.devices > 0 and torch.cuda.is_available()) else "cpu")
-    teacher = teacher.to(device).eval()
-    seq_loader = DataLoader(t_train_loader.dataset, batch_size=args.batch_size, shuffle=False)
-    logits_list = []
-    with torch.no_grad():
-        for x_b, _ in seq_loader:
-            logits_list.append(teacher(x_b.to(device)).cpu())
-    return torch.cat(logits_list, dim=0)
 
 
 def main() -> None:
@@ -186,7 +324,7 @@ def main() -> None:
     subject_ids, subset_tag = normalize_subject_list(args.subject, args.subjects, args.num_subjects)
 
     if args.cmd == "eval" or args.verify_codebook or args.stage == "cascade":
-        _print_codebook_and_viterbi_report()
+        _print_codebook_and_viterbi_report(paths=paths, subset_tag=subset_tag, modality=args.modality)
         if args.cmd == "eval":
             return
 
@@ -199,6 +337,7 @@ def main() -> None:
             num_runs=args.num_runs,
             label_mode=args.label_mode,
             time_steps=args.time_steps,
+            force=args.force_cache,
         )
         return
 
@@ -232,13 +371,14 @@ def main() -> None:
         channels=args.channels,
         subset_tag="smoke" if smoke_mode else subset_tag,
     )
+    model_prefix = f"edge_eeg_{args.stage}"
 
     if args.cmd == "export":
         best_ckpt = run_dir / "best.ckpt"
         if best_ckpt.exists():
             ckpt = torch.load(best_ckpt, map_location="cpu", weights_only=False)
             model.load_state_dict(ckpt["model_state"], strict=False)
-        export_model_to_c_header(model, run_dir, model_prefix=f"edge_eeg_{args.stage}")
+        export_model_to_c_header(model, run_dir, model_prefix=model_prefix)
         return
 
     teacher_logits = None
@@ -249,9 +389,10 @@ def main() -> None:
             subject_ids=subject_ids,
             subset_tag=subset_tag,
             smoke_mode=smoke_mode,
+            expected_train_len=len(train_loader.dataset),
         )
 
-    run_training_session(
+    summary = run_training_session(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
@@ -264,10 +405,25 @@ def main() -> None:
         use_gpu=(args.devices > 0),
         qat=args.qat,
         distill_teacher_logits=teacher_logits,
+        model_prefix=model_prefix,
     )
 
+    # Round 2: When training 306-ch TeacherConformerTCN, automatically extract and save `teacher_logits.pt`
+    if args.arch == "teacher_conformer":
+        device = torch.device("cuda" if (args.devices > 0 and torch.cuda.is_available()) else "cpu")
+        _extract_and_save_teacher_logits(
+            teacher=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            teacher_dir=run_dir,
+            device=device,
+            best_val_f1=float(summary.get("best_val_f1_macro", 0.0)),
+            num_runs=args.num_runs,
+            label_mode=args.label_mode,
+        )
+
     if smoke_mode:
-        _print_codebook_and_viterbi_report()
+        _print_codebook_and_viterbi_report(paths=paths, subset_tag="smoke", modality=args.modality)
 
 
 if __name__ == "__main__":
