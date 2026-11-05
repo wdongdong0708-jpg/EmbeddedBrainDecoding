@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "edge-eeg"
+version = "0.1.0"
+description = "Hierarchical Cascade Neural Speech Decoding (VAD -> Tone/Phoneme -> Viterbi Lexicon) for Resource-Constrained Edge MCUs"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "torch>=2.0",
+]
+
+[project.scripts]
+edge-eeg = "edge_eeg.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["edge_eeg*"]

@@ -1,0 +1,27 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Local workspace data, caches, and training runs (managed via EDGEEEG_* env vars)
+workspace/
+*.ckpt
+*.pt
+*.pth
+*.tflite
+*.onnx
+*.tar
+*.h5
+
+# Virtual environments & IDE
+.venv/
+venv/
+eeg-venv/
+.vscode/
+.idea/
+.DS_Store

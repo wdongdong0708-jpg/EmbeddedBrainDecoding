@@ -1,0 +1,6 @@
+# Colab incremental dependencies (installed with -c runtime-constraints.txt to protect pre-installed PyTorch/CUDA)
+pnpl>=0.0.2
+mne>=1.6
+h5py>=3.8
+tqdm>=4.65
+onnx>=1.15
