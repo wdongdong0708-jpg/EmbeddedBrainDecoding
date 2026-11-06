@@ -14,7 +14,7 @@ config.py[CC8T]: F:Resolves EDGEEEG_STUDIES, EDGEEEG_CACHE, and EDGEEEG_RESULTS 
 
 ===C:/Users/Administrator/Desktop/EmbeddedBrainDecoding/edge_eeg/data/===
 __init__.py[CD2T]: F:Re-exports real PNPL LibriBrain dataset builders, cache preparation, and ARPAbet-to-place5 mappings | R:code:edge_eeg/data/libribrain_adapter.py | A:ARPABET_TO_PLACE5,build_dataloaders,prepare_subject_cache | S:-
-libribrain_adapter.py[ID8L]: F:Loads real PNPL LibriBrain MEG runs, performs phase-aligned per-run balanced VAD and within-split phoneme grouping, and writes v4/v2 cache shards | R:code:edge_eeg/config.py | A:ARPABET_TO_PLACE5,PROTO_PLACE5,get_train_run_keys,prepare_subject_cache,build_dataloaders | S:Excludes the initial 4.0s IIR filter startup ringing and enforces a 5% chronological embargo gap within each run between Train and Val splits
+libribrain_adapter.py[ID8L]: F:Loads real PNPL LibriBrain MEG runs, performs Block-AGC phase-aligned VAD and within-split phoneme grouping, and writes v5/v2 cache shards | R:code:edge_eeg/config.py | A:ARPABET_TO_PLACE5,PROTO_PLACE5,get_train_run_keys,prepare_subject_cache,build_dataloaders | S:Excludes the initial 4.0s IIR filter startup ringing and enforces a 5% chronological embargo gap within each run between Train and Val splits
 
 ===C:/Users/Administrator/Desktop/EmbeddedBrainDecoding/edge_eeg/engine/===
 __init__.py[CW2T]: F:Exposes training session execution, macro-F1 evaluation, QAT unwrapping, and C99 header export helpers | R:code:edge_eeg/engine/trainer.py,code:edge_eeg/engine/exporter.py | A:compute_f1_macro,export_model_to_c_header,run_training_session,unwrap_qat_modules | S:-
