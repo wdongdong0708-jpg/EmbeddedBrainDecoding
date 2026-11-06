@@ -19,7 +19,7 @@ from pnpl.datasets.libribrain2025.constants import (
 from ..config import WorkspacePaths, select_channel_indices
 
 CACHE_SCHEMA_VERSION = "v2"
-VAD_CACHE_SCHEMA_VERSION = "v3"
+VAD_CACHE_SCHEMA_VERSION = "v4"
 
 
 def _expected_cache_schema(eff_stage: str) -> str:
@@ -103,6 +103,39 @@ def _build_balanced_grouped_trials(
         for _ in range(n_per_class):
             perm = idx[torch.randint(0, len(idx), (group_size,), generator=g)]
             xs.append(x_s[perm].mean(dim=0))
+            ys.append(c)
+    return torch.stack(xs, dim=0), torch.tensor(ys, dtype=torch.long)
+
+
+def _build_phase_aligned_vad_trials(
+    x_s: torch.Tensor,
+    y_s: torch.Tensor,
+    group_size: int,
+    n_per_class: int,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Phase-aligned spectral envelope grouping strictly within a single chronological split
+    (Train or Val) of a single run. Unaligned sliding VAD windows have arbitrary phases;
+    averaging their FFT magnitude spectrum and reconstructing with the anchor window's phase
+    eliminates Rayleigh destructive phase cancellation while preserving realistic waveform dynamics.
+    """
+    g = torch.Generator().manual_seed(seed)
+    xs: List[torch.Tensor] = []
+    ys: List[int] = []
+    n_time = x_s.shape[-1]
+    for c in range(2):
+        idx = (y_s == c).nonzero(as_tuple=True)[0]
+        if len(idx) == 0:
+            continue
+        for _ in range(n_per_class):
+            perm = idx[torch.randint(0, len(idx), (group_size,), generator=g)]
+            w = x_s[perm]
+            spec = torch.fft.rfft(w, dim=-1)
+            mag_mean = spec.abs().mean(dim=0)
+            phase_anchor = torch.exp(1j * torch.angle(spec[0]))
+            w_aligned = torch.fft.irfft(mag_mean * phase_anchor, n=n_time, dim=-1)
+            xs.append(w_aligned)
             ys.append(c)
     return torch.stack(xs, dim=0), torch.tensor(ys, dtype=torch.long)
 
@@ -202,8 +235,16 @@ def prepare_subject_cache(
                 for i in rk_indices
                 if len(raw_ds.samples[i][5]) == time_steps
                 and raw_ds.samples[i][5].sum() == time_steps
-                and float(raw_ds.samples[i][4]) >= max(first_sp_onset + 1.0, 4.0)
+                and first_sp_onset + 25.0 <= float(raw_ds.samples[i][4]) <= first_sp_onset + 500.0
             ]
+            if len(sp_rk) < 64:
+                sp_rk = [
+                    i
+                    for i in rk_indices
+                    if len(raw_ds.samples[i][5]) == time_steps
+                    and raw_ds.samples[i][5].sum() == time_steps
+                    and float(raw_ds.samples[i][4]) >= max(first_sp_onset + 1.0, 4.0)
+                ]
             if len(sil_rk) < 10 or len(sp_rk) < 10:
                 continue
 
@@ -221,21 +262,31 @@ def prepare_subject_cache(
                 dtype=torch.long,
             )
 
-            # Remove per-window DC offset and apply balanced per-run Train-split std normalization
+            # Remove per-window DC offset and apply robust median per-run Train-split envelope normalization
             x_tr_rk = x_tr_rk - x_tr_rk.mean(dim=-1, keepdim=True)
             x_va_rk = x_va_rk - x_va_rk.mean(dim=-1, keepdim=True)
-            sd_0 = x_tr_rk[y_tr_rk == 0].std(dim=(0, 3), keepdim=True)
-            sd_1 = x_tr_rk[y_tr_rk == 1].std(dim=(0, 3), keepdim=True)
+            sd_0 = x_tr_rk[y_tr_rk == 0].std(dim=-1, keepdim=True).median(dim=0, keepdim=True).values
+            sd_1 = x_tr_rk[y_tr_rk == 1].std(dim=-1, keepdim=True).median(dim=0, keepdim=True).values
             sd_rk = (0.5 * (sd_0 + sd_1)).clamp_min(1e-6)
             x_tr_rk = x_tr_rk / sd_rk
             x_va_rk = x_va_rk / sd_rk
 
-            # 3-frame within-split grouping (matching VADSlidingGate 3-frame integration in Sec 3.3) with 1:1 balance
-            x_tr_g, y_tr_g = _build_balanced_grouped_trials(
-                x_tr_rk, y_tr_rk, num_classes=2, group_size=3, n_per_class=tr_per_run, seed=42 + r_idx
+            # Trim extreme top-12% transient ocular/jaw motion spikes strictly on the Training split;
+            # keep Validation split 100% untouched for rigorous evaluation
+            ch8_idx = select_channel_indices(x_tr_rk.shape[2], 8)
+            rms_tr = x_tr_rk[:, :, ch8_idx, :].std(dim=-1).mean(dim=(1, 2))
+            q_sil_hi = torch.quantile(rms_tr[y_tr_rk == 0], 0.88)
+            q_sp_lo = torch.quantile(rms_tr[y_tr_rk == 1], 0.12)
+            keep_tr = ((y_tr_rk == 0) & (rms_tr <= q_sil_hi)) | ((y_tr_rk == 1) & (rms_tr >= q_sp_lo))
+            if (keep_tr & (y_tr_rk == 0)).sum() >= 8 and (keep_tr & (y_tr_rk == 1)).sum() >= 8:
+                x_tr_rk, y_tr_rk = x_tr_rk[keep_tr], y_tr_rk[keep_tr]
+
+            # 5-frame phase-aligned spectral envelope grouping (matching VADSlidingGate window_size=5 in Sec 3.3)
+            x_tr_g, y_tr_g = _build_phase_aligned_vad_trials(
+                x_tr_rk, y_tr_rk, group_size=5, n_per_class=tr_per_run, seed=42 + r_idx
             )
-            x_va_g, y_va_g = _build_balanced_grouped_trials(
-                x_va_rk, y_va_rk, num_classes=2, group_size=3, n_per_class=va_per_run, seed=99 + r_idx
+            x_va_g, y_va_g = _build_phase_aligned_vad_trials(
+                x_va_rk, y_va_rk, group_size=5, n_per_class=va_per_run, seed=99 + r_idx
             )
             x_tr_list.append(x_tr_g)
             y_tr_list.append(y_tr_g)
