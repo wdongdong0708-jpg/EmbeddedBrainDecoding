@@ -19,6 +19,11 @@ from pnpl.datasets.libribrain2025.constants import (
 from ..config import WorkspacePaths, select_channel_indices
 
 CACHE_SCHEMA_VERSION = "v2"
+VAD_CACHE_SCHEMA_VERSION = "v3"
+
+
+def _expected_cache_schema(eff_stage: str) -> str:
+    return VAD_CACHE_SCHEMA_VERSION if eff_stage == "vad" else CACHE_SCHEMA_VERSION
 
 # Mapping from 39 ARPAbet phonemes in LibriBrainPhoneme to 5 Neuro-Acoustic Articulatory Clusters (C1..C5 -> 0..4)
 ARPABET_TO_PLACE5: Dict[str, int] = {
@@ -118,14 +123,15 @@ def prepare_subject_cache(
     Downloads raw .h5 and _events.tsv files into `paths.studies_dir / 'libribrain'` if not yet present.
     """
     eff_stage = "phoneme" if stage == "cascade" else stage
+    expected_schema = _expected_cache_schema(eff_stage)
     target_pt = _cache_file_path(paths.cache_dir, modality, eff_stage, label_mode, num_runs)
     manifest = paths.cache_dir / f"manifest_{modality}_{eff_stage}.json"
 
     if target_pt.exists() and max_samples is None and not force:
         try:
             existing_meta = json.loads(manifest.read_text(encoding="utf-8")) if manifest.exists() else {}
-            if existing_meta.get("cache_schema") == CACHE_SCHEMA_VERSION and existing_meta.get("num_runs") == num_runs:
-                print(f"[cache] Reusing verified {CACHE_SCHEMA_VERSION} LibriBrain cache shard: {target_pt}")
+            if existing_meta.get("cache_schema") == expected_schema and existing_meta.get("num_runs") == num_runs:
+                print(f"[cache] Reusing verified {expected_schema} LibriBrain cache shard: {target_pt}")
                 return target_pt
         except Exception:
             pass
@@ -151,35 +157,95 @@ def prepare_subject_cache(
             download=True,
         )
         num_classes = 2
-        # Exclude 0..4.0s IIR bandpass filter startup transient and 0 < ratio < 1.0 boundary transition windows
-        sil_idx = [
-            i
-            for i, s in enumerate(raw_ds.samples)
-            if len(s[5]) == time_steps and s[5].sum() == 0 and 4.0 <= float(s[4]) < 28.5
-        ]
-        sp_idx = [
-            i
-            for i, s in enumerate(raw_ds.samples)
-            if len(s[5]) == time_steps and s[5].sum() == time_steps
-        ]
+        tr_per_run = 1000 if len(run_keys) == 1 else max(400, 3200 // len(run_keys))
+        va_per_run = 250 if len(run_keys) == 1 else max(100, 800 // len(run_keys))
         if max_samples is not None:
-            half = max(max_samples // 2, 1)
-            sil_idx = sil_idx[:half]
-            sp_idx = sp_idx[:half]
+            tr_per_run = max(max_samples // (4 * max(len(run_keys), 1)), 16)
+            va_per_run = max(tr_per_run // 4, 8)
 
-        # Chronological 75% Train / 5% Embargo Gap (zero window overlap) / 20% Val per class
-        n_sil_tr, n_sil_va0 = int(len(sil_idx) * 0.75), int(len(sil_idx) * 0.80)
-        n_sp_tr, n_sp_va0 = int(len(sp_idx) * 0.75), int(len(sp_idx) * 0.80)
-        tr_indices = sil_idx[:n_sil_tr] + sp_idx[:n_sp_tr]
-        va_indices = sil_idx[n_sil_va0:] + sp_idx[n_sp_va0:]
+        x_tr_list: List[torch.Tensor] = []
+        y_tr_list: List[torch.Tensor] = []
+        x_va_list: List[torch.Tensor] = []
+        y_va_list: List[torch.Tensor] = []
 
-        x_tr = torch.stack([_extract_clipped_window(raw_ds, i, time_steps) for i in tr_indices], dim=0)
-        y_tr = torch.tensor([0] * n_sil_tr + [1] * n_sp_tr, dtype=torch.long)
-        x_va = torch.stack([_extract_clipped_window(raw_ds, i, time_steps) for i in va_indices], dim=0)
-        y_va = torch.tensor(
-            [0] * (len(sil_idx) - n_sil_va0) + [1] * (len(sp_idx) - n_sp_va0),
-            dtype=torch.long,
-        )
+        for r_idx, rk in enumerate(run_keys):
+            rk_indices = [
+                i for i, s in enumerate(raw_ds.samples) if (s[0], s[1], s[2], s[3]) == rk
+            ]
+            if not rk_indices:
+                continue
+            sp_onsets = [
+                float(raw_ds.samples[i][4])
+                for i in rk_indices
+                if len(raw_ds.samples[i][5]) == time_steps and raw_ds.samples[i][5].sum() > 0
+            ]
+            first_sp_onset = min(sp_onsets) if sp_onsets else 28.5
+
+            # Exclude 0..4.0s IIR startup transient and speech-onset boundary transition windows per run
+            sil_rk = [
+                i
+                for i in rk_indices
+                if len(raw_ds.samples[i][5]) == time_steps
+                and raw_ds.samples[i][5].sum() == 0
+                and 4.0 <= float(raw_ds.samples[i][4]) < first_sp_onset - 1.0
+            ]
+            if len(sil_rk) < 32:
+                sil_rk = [
+                    i
+                    for i in rk_indices
+                    if len(raw_ds.samples[i][5]) == time_steps
+                    and raw_ds.samples[i][5].sum() == 0
+                    and float(raw_ds.samples[i][4]) >= 4.0
+                ]
+            sp_rk = [
+                i
+                for i in rk_indices
+                if len(raw_ds.samples[i][5]) == time_steps
+                and raw_ds.samples[i][5].sum() == time_steps
+                and float(raw_ds.samples[i][4]) >= max(first_sp_onset + 1.0, 4.0)
+            ]
+            if len(sil_rk) < 10 or len(sp_rk) < 10:
+                continue
+
+            # Chronological 75% Train / 5% Embargo Gap (zero window overlap) / 20% Val strictly WITHIN each run
+            n_sil_tr, n_sil_va0 = int(len(sil_rk) * 0.75), int(len(sil_rk) * 0.80)
+            n_sp_tr, n_sp_va0 = int(len(sp_rk) * 0.75), int(len(sp_rk) * 0.80)
+            tr_indices = sil_rk[:n_sil_tr] + sp_rk[:n_sp_tr]
+            va_indices = sil_rk[n_sil_va0:] + sp_rk[n_sp_va0:]
+
+            x_tr_rk = torch.stack([_extract_clipped_window(raw_ds, i, time_steps) for i in tr_indices], dim=0)
+            y_tr_rk = torch.tensor([0] * n_sil_tr + [1] * n_sp_tr, dtype=torch.long)
+            x_va_rk = torch.stack([_extract_clipped_window(raw_ds, i, time_steps) for i in va_indices], dim=0)
+            y_va_rk = torch.tensor(
+                [0] * (len(sil_rk) - n_sil_va0) + [1] * (len(sp_rk) - n_sp_va0),
+                dtype=torch.long,
+            )
+
+            # Remove per-window DC offset and apply balanced per-run Train-split std normalization
+            x_tr_rk = x_tr_rk - x_tr_rk.mean(dim=-1, keepdim=True)
+            x_va_rk = x_va_rk - x_va_rk.mean(dim=-1, keepdim=True)
+            sd_0 = x_tr_rk[y_tr_rk == 0].std(dim=(0, 3), keepdim=True)
+            sd_1 = x_tr_rk[y_tr_rk == 1].std(dim=(0, 3), keepdim=True)
+            sd_rk = (0.5 * (sd_0 + sd_1)).clamp_min(1e-6)
+            x_tr_rk = x_tr_rk / sd_rk
+            x_va_rk = x_va_rk / sd_rk
+
+            # 3-frame within-split grouping (matching VADSlidingGate 3-frame integration in Sec 3.3) with 1:1 balance
+            x_tr_g, y_tr_g = _build_balanced_grouped_trials(
+                x_tr_rk, y_tr_rk, num_classes=2, group_size=3, n_per_class=tr_per_run, seed=42 + r_idx
+            )
+            x_va_g, y_va_g = _build_balanced_grouped_trials(
+                x_va_rk, y_va_rk, num_classes=2, group_size=3, n_per_class=va_per_run, seed=99 + r_idx
+            )
+            x_tr_list.append(x_tr_g)
+            y_tr_list.append(y_tr_g)
+            x_va_list.append(x_va_g)
+            y_va_list.append(y_va_g)
+
+        x_tr = torch.cat(x_tr_list, dim=0)
+        y_tr = torch.cat(y_tr_list, dim=0)
+        x_va = torch.cat(x_va_list, dim=0)
+        y_va = torch.cat(y_va_list, dim=0)
         split_index = int(x_tr.shape[0])
         x_tensor = torch.cat([x_tr, x_va], dim=0)
         y_tensor = torch.cat([y_tr, y_va], dim=0)
@@ -255,7 +321,7 @@ def prepare_subject_cache(
                 "y": y_tensor,
                 "num_classes": num_classes,
                 "split_index": split_index,
-                "cache_schema": CACHE_SCHEMA_VERSION,
+                "cache_schema": expected_schema,
                 "source": "pnpl_libribrain_real",
                 "run_keys": run_keys,
                 "label_mode": label_mode,
@@ -272,7 +338,7 @@ def prepare_subject_cache(
                     "num_trials": int(x_tensor.shape[0]),
                     "split_index": split_index,
                     "num_classes": num_classes,
-                    "cache_schema": CACHE_SCHEMA_VERSION,
+                    "cache_schema": expected_schema,
                     "source": "pnpl_libribrain_real",
                 },
                 indent=2,
@@ -280,7 +346,7 @@ def prepare_subject_cache(
             encoding="utf-8",
         )
         print(
-            f"[cache] Saved real LibriBrain shard ({CACHE_SCHEMA_VERSION}): {x_tensor.shape[0]} trials "
+            f"[cache] Saved real LibriBrain shard ({expected_schema}): {x_tensor.shape[0]} trials "
             f"(train={split_index}, val={x_tensor.shape[0]-split_index}), "
             f"shape={tuple(x_tensor.shape)}, classes={num_classes} -> {target_pt}"
         )
@@ -306,6 +372,7 @@ def build_dataloaders(
     so smoke tests execute in ~1-2 seconds on 100% genuine human neural recordings.
     """
     eff_stage = "phoneme" if stage == "cascade" else stage
+    expected_schema = _expected_cache_schema(eff_stage)
     shard_path = _cache_file_path(paths.cache_dir, modality, eff_stage, label_mode, num_runs)
 
     if not shard_path.exists():
@@ -325,8 +392,8 @@ def build_dataloaders(
         )
 
     payload = torch.load(shard_path, map_location="cpu", weights_only=False)
-    if payload.get("cache_schema") != CACHE_SCHEMA_VERSION and (paths.studies_dir / "libribrain").exists():
-        print(f"[cache] Upgrading legacy cache shard {shard_path.name} to schema {CACHE_SCHEMA_VERSION}...")
+    if payload.get("cache_schema") != expected_schema and (paths.studies_dir / "libribrain").exists():
+        print(f"[cache] Upgrading legacy cache shard {shard_path.name} to schema {expected_schema}...")
         prepare_subject_cache(
             paths=paths,
             modality=modality,
